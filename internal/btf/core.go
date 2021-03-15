@@ -114,7 +114,7 @@ func coreRelocate(local, target *Spec, coreRelos bpfCoreRelos) (map[uint64]Reloc
 			return nil, fmt.Errorf("relocate anonymous type %s: %w", typ.String(), ErrNotSupported)
 		}
 
-		name := essentialName(named.name())
+		name := named.essentialName()
 		res, err := coreCalculateRelocation(typ, target.namedTypes[name], relo.ReloKind, accessor)
 		if err != nil {
 			return nil, fmt.Errorf("relocate %s: %w", name, err)
@@ -127,6 +127,7 @@ func coreRelocate(local, target *Spec, coreRelos bpfCoreRelos) (map[uint64]Reloc
 }
 
 var errAmbiguousRelocation = errors.New("ambiguous relocation")
+var errImpossibleRelocation = errors.New("impossible relocation")
 
 func coreCalculateRelocation(local Type, targets []namedType, kind coreReloKind, localAccessor coreAccessor) (Relocation, error) {
 	local, err := copyType(local, skipQualifierAndTypedef)
@@ -136,8 +137,14 @@ func coreCalculateRelocation(local Type, targets []namedType, kind coreReloKind,
 
 	var relos []Relocation
 	var matches []Type
-	for _, target := range targets {
-		target, err := copyType(target, skipQualifierAndTypedef)
+
+	addRelo := func(target Type, current, new uint32) {
+		relos = append(relos, Relocation{current, new})
+		matches = append(matches, target)
+	}
+
+	for _, namedTarget := range targets {
+		target, err := copyType(namedTarget, skipQualifierAndTypedef)
 		if err != nil {
 			return Relocation{}, err
 		}
@@ -154,16 +161,35 @@ func coreCalculateRelocation(local Type, targets []namedType, kind coreReloKind,
 				continue
 			}
 
-			relos = append(relos, Relocation{uint32(target.ID()), uint32(target.ID())})
+			addRelo(target, uint32(local.ID()), uint32(target.ID()))
+
+		case reloEnumvalValue, reloEnumvalExists:
+			localValue, targetValue, err := coreFindEnumValue(local, localAccessor, target)
+			if errors.Is(err, errImpossibleRelocation) {
+				continue
+			}
+			if err != nil {
+				return Relocation{}, err
+			}
+
+			switch kind {
+			case reloEnumvalExists:
+				addRelo(target, 1, 1)
+
+			case reloEnumvalValue:
+				addRelo(target, uint32(localValue.Value), uint32(targetValue.Value))
+			}
 
 		default:
 			return Relocation{}, fmt.Errorf("relocation %s: %w", kind, ErrNotSupported)
 		}
-		matches = append(matches, target)
 	}
 
 	if len(relos) == 0 {
-		// TODO: Add switch for existence checks like reloEnumvalExists here.
+		switch kind {
+		case reloEnumvalExists:
+			return Relocation{1, 0}, nil
+		}
 
 		// TODO: This might have to be poisoned.
 		return Relocation{}, fmt.Errorf("no relocation found, tried %v", targets)
@@ -227,6 +253,48 @@ func parseCoreAccessor(accessor string) (coreAccessor, error) {
 	}
 
 	return result, nil
+}
+
+func (ca coreAccessor) String() string {
+	strs := make([]string, 0, len(ca))
+	for _, i := range ca {
+		strs = append(strs, strconv.Itoa(i))
+	}
+	return strings.Join(strs, ":")
+}
+
+// coreFindEnumValue follows localAcc to find the equivalent enum value in target.
+func coreFindEnumValue(local Type, localAcc coreAccessor, target Type) (localValue, targetValue *EnumValue, _ error) {
+	localEnum, ok := local.(*Enum)
+	if !ok {
+		return nil, nil, fmt.Errorf("can't apply enum relocation to %s", local)
+	}
+
+	targetEnum, ok := target.(*Enum)
+	if !ok {
+		return nil, nil, errImpossibleRelocation
+	}
+
+	if len(localAcc) > 1 {
+		return nil, nil, fmt.Errorf("invalid accessor %s for enum", localAcc)
+	}
+
+	i := localAcc[0]
+	if i >= len(localEnum.Values) {
+		return nil, nil, fmt.Errorf("invalid index %d for %s", i, local)
+	}
+
+	localValue = &localEnum.Values[i]
+	localName := localValue.Name.essentialName()
+	for i, targetValue := range targetEnum.Values {
+		if targetValue.Name.essentialName() != localName {
+			continue
+		}
+
+		return localValue, &targetEnum.Values[i], nil
+	}
+
+	return nil, nil, errImpossibleRelocation
 }
 
 /* The comment below is from bpf_core_types_are_compat in libbpf.c:
