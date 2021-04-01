@@ -129,9 +129,19 @@ func coreRelocate(local, target *Spec, coreRelos bpfCoreRelos) (map[uint64]Reloc
 var errAmbiguousRelocation = errors.New("ambiguous relocation")
 
 func coreCalculateRelocation(local Type, targets []namedType, kind coreReloKind, localAccessor coreAccessor) (Relocation, error) {
+	local, err := copyType(local, skipQualifierAndTypedef)
+	if err != nil {
+		return Relocation{}, err
+	}
+
 	var relos []Relocation
 	var matches []Type
 	for _, target := range targets {
+		target, err := copyType(target, skipQualifierAndTypedef)
+		if err != nil {
+			return Relocation{}, err
+		}
+
 		switch kind {
 		case reloTypeIDTarget:
 			if localAccessor[0] != 0 {
@@ -252,8 +262,8 @@ func coreAreTypesCompatible(localType Type, targetType Type) (bool, error) {
 			return false, errors.New("types are nested too deep")
 		}
 
-		localType = skipQualifierAndTypedef(*l)
-		targetType = skipQualifierAndTypedef(*t)
+		localType = *l
+		targetType = *t
 
 		if reflect.TypeOf(localType) != reflect.TypeOf(targetType) {
 			return false, nil
@@ -329,9 +339,6 @@ func coreAreMembersCompatible(localType Type, targetType Type) (bool, error) {
 	}
 
 	for depth := 0; depth <= maxTypeDepth; depth++ {
-		localType = skipQualifierAndTypedef(localType)
-		targetType = skipQualifierAndTypedef(targetType)
-
 		_, lok := localType.(composite)
 		_, tok := targetType.(composite)
 		if lok && tok {
@@ -372,7 +379,7 @@ func coreAreMembersCompatible(localType Type, targetType Type) (bool, error) {
 	return false, errors.New("types are nested too deep")
 }
 
-func skipQualifierAndTypedef(typ Type) Type {
+func skipQualifierAndTypedef(typ Type) (Type, error) {
 	result := typ
 	for depth := 0; depth <= maxTypeDepth; depth++ {
 		switch v := (result).(type) {
@@ -381,8 +388,8 @@ func skipQualifierAndTypedef(typ Type) Type {
 		case *Typedef:
 			result = v.Type
 		default:
-			return result
+			return result, nil
 		}
 	}
-	return typ
+	return nil, errors.New("exceeded type depth")
 }
