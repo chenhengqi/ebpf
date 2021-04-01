@@ -155,6 +155,55 @@ __section("socket_filter/enums") int enums() {
 	return 0;
 }
 
+#define field_exists(f) \
+	({ \
+		if (!bpf_core_field_exists(f)) { \
+			return __LINE__; \
+		} \
+	})
+
+#define field_size_matches(f) \
+	({ \
+		if (sizeof(f) != bpf_core_field_size(f)) { \
+			return __LINE__; \
+		} \
+	})
+
+__section("socket_filter/fields") int fields() {
+	field_exists((struct s){}._1);
+	field_exists((s_t){}._2);
+	field_exists((union u){}._1);
+	field_exists((u_t){}._2);
+
+	field_size_matches((struct s){}._1);
+	field_size_matches((s_t){}._2);
+	field_size_matches((union u){}._1);
+	field_size_matches((u_t){}._2);
+
+	struct flarp {
+		union {
+			s_t s[10];
+		};
+		struct {
+			union u u;
+		};
+	} bar;
+
+	field_exists(bar.s[2]._1);
+	field_exists(bar.s[1]._2);
+	field_exists(bar.u._1);
+	field_exists(bar.u._2);
+	field_exists((&bar)[1]);
+
+	field_size_matches(bar.s[2]._1);
+	field_size_matches(bar.s[1]._2);
+	field_size_matches(bar.u._1);
+	field_size_matches(bar.u._2);
+	field_size_matches((&bar)[1]);
+
+	return 0;
+}
+
 struct ambiguous {
 	int _1;
 	char _2;

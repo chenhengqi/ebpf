@@ -150,6 +150,36 @@ func coreCalculateRelocation(local Type, targets []namedType, kind coreReloKind,
 		}
 
 		switch kind {
+		case reloFieldByteOffset, reloFieldByteSize, reloFieldExists:
+			localField, targetField, err := coreFindField(local, localAccessor, target)
+			if errors.Is(err, errImpossibleRelocation) {
+				continue
+			}
+			if err != nil {
+				return Relocation{}, fmt.Errorf("target %s: %w", target, err)
+			}
+
+			switch kind {
+			case reloFieldByteOffset:
+				addRelo(target, localField.offset/8, targetField.offset/8)
+
+			case reloFieldByteSize:
+				localSize, err := Sizeof(localField.Type)
+				if err != nil {
+					return Relocation{}, err
+				}
+
+				targetSize, err := Sizeof(targetField.Type)
+				if err != nil {
+					return Relocation{}, err
+				}
+
+				addRelo(target, uint32(localSize), uint32(targetSize))
+
+			case reloFieldExists:
+				addRelo(target, 1, 1)
+			}
+
 		case reloTypeIDTarget, reloTypeSize, reloTypeExists:
 			if localAccessor[0] != 0 || len(localAccessor) > 1 {
 				return Relocation{}, fmt.Errorf("%s: unexpected accessor: %s", kind, localAccessor)
@@ -206,7 +236,7 @@ func coreCalculateRelocation(local Type, targets []namedType, kind coreReloKind,
 
 	if len(relos) == 0 {
 		switch kind {
-		case reloTypeExists, reloEnumvalExists:
+		case reloFieldExists, reloTypeExists, reloEnumvalExists:
 			return Relocation{1, 0}, nil
 		}
 
@@ -280,6 +310,169 @@ func (ca coreAccessor) String() string {
 		strs = append(strs, strconv.Itoa(i))
 	}
 	return strings.Join(strs, ":")
+}
+
+type coreField struct {
+	Type   Type
+	offset uint32
+}
+
+func adjustOffset(base uint32, t Type, n int) (uint32, error) {
+	size, err := Sizeof(t)
+	if err != nil {
+		return 0, err
+	}
+
+	return base + (uint32(n) * uint32(size) * 8), nil
+}
+
+// coreFindField descends into the local type using the accessor and tries to
+// find an equivalent field in target at each step.
+//
+// Returns the field and the offset of the field from the start of
+// target in bits.
+func coreFindField(local Type, localAcc coreAccessor, target Type) (_, _ coreField, _ error) {
+	// The first index is used to offset a pointer of the base type like
+	// when accessing an array.
+	localOffset, err := adjustOffset(0, local, localAcc[0])
+	if err != nil {
+		return coreField{}, coreField{}, err
+	}
+
+	targetOffset, err := adjustOffset(0, target, localAcc[0])
+	if err != nil {
+		return coreField{}, coreField{}, err
+	}
+
+	if compat, err := coreAreMembersCompatible(local, target); err != nil {
+		return coreField{}, coreField{}, err
+	} else if !compat {
+		return coreField{}, coreField{}, errImpossibleRelocation
+	}
+
+	for _, acc := range localAcc[1:] {
+	match:
+		switch localType := local.(type) {
+		case composite:
+			// For composite types acc is used to find the field in the local type,
+			// and then we try to find a field in target with the same name.
+			localMembers := localType.members()
+			if acc >= len(localMembers) {
+				return coreField{}, coreField{}, fmt.Errorf("invalid accessor %d for %s", acc, local)
+			}
+
+			localMember := localMembers[acc]
+			if localMember.Name == "" {
+				_, ok := localMember.Type.(composite)
+				if !ok {
+					return coreField{}, coreField{}, fmt.Errorf("unnamed field with type %s: %s", localMember.Type, ErrNotSupported)
+				}
+
+				// This is an anonymous struct or union, ignore it.
+				local = localMember.Type
+				localOffset += localMember.Offset
+				continue
+			}
+
+			targetType, ok := target.(composite)
+			if !ok {
+				return coreField{}, coreField{}, errImpossibleRelocation
+			}
+
+			targetMembers := copyMembers(targetType.members())
+			visited := make(map[composite]bool)
+
+			for i := 0; i < len(targetMembers); i++ {
+				targetMember := targetMembers[i]
+
+				if targetMember.Name != localMember.Name {
+					if targetMember.Name != "" {
+						continue
+					}
+
+					comp, ok := targetMember.Type.(composite)
+					if !ok || visited[comp] {
+						continue
+					}
+
+					// The target is an anonymous struct or union, pretend
+					// that it doesn't exist so that we try to relocate
+					// against the nested members.
+					for _, nested := range comp.members() {
+						targetMembers = append(targetMembers, Member{
+							nested.Name,
+							nested.Type,
+							nested.Offset + targetMember.Offset,
+							nested.BitfieldSize,
+						})
+					}
+
+					// Only visit anonymous types once to prevent
+					// infinite recursion.
+					visited[comp] = true
+					continue
+				}
+
+				// The names match, including anonymous types.
+				compat, err := coreAreMembersCompatible(localMember.Type, targetMember.Type)
+				if err != nil {
+					return coreField{}, coreField{}, err
+				}
+				if !compat {
+					continue
+				}
+
+				local = localMember.Type
+				localOffset += localMember.Offset
+				target = targetMember.Type
+				targetOffset += targetMember.Offset
+				break match
+			}
+
+			return coreField{}, coreField{}, errImpossibleRelocation
+
+		case *Array:
+			// For arrays, acc is the index in the target.
+			targetType, ok := target.(*Array)
+			if !ok {
+				return coreField{}, coreField{}, errImpossibleRelocation
+			}
+
+			// Only check the index if the array has a size, to allow
+			// flexible array members. This is more lenient than it has to be,
+			// since it doesn't check that the array is at the end of an
+			// enclosing struct.
+			if localType.Nelems > 0 && acc >= int(localType.Nelems) {
+				return coreField{}, coreField{}, fmt.Errorf("invalid access of %s at index %d", localType, acc)
+			}
+			if targetType.Nelems > 0 && acc >= int(targetType.Nelems) {
+				return coreField{}, coreField{}, fmt.Errorf("out of bounds access of target: %w", errImpossibleRelocation)
+			}
+
+			local = localType.Type
+			localOffset, err = adjustOffset(localOffset, local, acc)
+			if err != nil {
+				return coreField{}, coreField{}, err
+			}
+
+			target = targetType.Type
+			targetOffset, err = adjustOffset(targetOffset, target, acc)
+			if err != nil {
+				return coreField{}, coreField{}, err
+			}
+
+			if compat, err := coreAreMembersCompatible(local, target); err != nil {
+				return coreField{}, coreField{}, err
+			} else if !compat {
+				return coreField{}, coreField{}, errImpossibleRelocation
+			}
+
+		default:
+			return coreField{}, coreField{}, fmt.Errorf("relocate field of %T: %w", localType, ErrNotSupported)
+		}
+	}
+
+	return coreField{local, localOffset}, coreField{target, targetOffset}, nil
 }
 
 // coreFindEnumValue follows localAcc to find the equivalent enum value in target.
@@ -397,7 +590,9 @@ func coreAreTypesCompatible(localType Type, targetType Type) (bool, error) {
 	return true, nil
 }
 
-/* The comment below is from bpf_core_fields_are_compat in libbpf.c:
+/* coreAreMembersCompatible checks two types for field-based relocation compatibility.
+ *
+ * The comment below is from bpf_core_fields_are_compat in libbpf.c:
  *
  * Check two types for compatibility for the purpose of field access
  * relocation. const/volatile/restrict and typedefs are skipped to ensure we
@@ -411,6 +606,8 @@ func coreAreTypesCompatible(localType Type, targetType Type) (bool, error) {
  *   - for INT, size and signedness are ignored;
  *   - for ARRAY, dimensionality is ignored, element types are checked for
  *     compatibility recursively;
+ *     [ NB: coreAreMembersCompatible doesn't recurse, this check is done
+ *       by coreFindField. ]
  *   - everything else shouldn't be ever a target of relocation.
  * These rules are not set in stone and probably will be adjusted as we get
  * more experience with using BPF CO-RE relocations.
@@ -425,45 +622,35 @@ func coreAreMembersCompatible(localType Type, targetType Type) (bool, error) {
 		return essentialName(a) == essentialName(b)
 	}
 
-	for depth := 0; depth <= maxTypeDepth; depth++ {
-		_, lok := localType.(composite)
-		_, tok := targetType.(composite)
-		if lok && tok {
-			return true, nil
-		}
-
-		if reflect.TypeOf(localType) != reflect.TypeOf(targetType) {
-			return false, nil
-		}
-
-		switch lv := localType.(type) {
-		case *Pointer:
-			return true, nil
-
-		case *Enum:
-			tv := targetType.(*Enum)
-			return doNamesMatch(lv.name(), tv.name()), nil
-
-		case *Fwd:
-			tv := targetType.(*Fwd)
-			return doNamesMatch(lv.name(), tv.name()), nil
-
-		case *Int:
-			tv := targetType.(*Int)
-			return !lv.isBitfield() && !tv.isBitfield(), nil
-
-		case *Array:
-			tv := targetType.(*Array)
-
-			localType = lv.Type
-			targetType = tv.Type
-
-		default:
-			return false, fmt.Errorf("unsupported type %T", localType)
-		}
+	_, lok := localType.(composite)
+	_, tok := targetType.(composite)
+	if lok && tok {
+		return true, nil
 	}
 
-	return false, errors.New("types are nested too deep")
+	if reflect.TypeOf(localType) != reflect.TypeOf(targetType) {
+		return false, nil
+	}
+
+	switch lv := localType.(type) {
+	case *Array, *Pointer:
+		return true, nil
+
+	case *Enum:
+		tv := targetType.(*Enum)
+		return doNamesMatch(lv.name(), tv.name()), nil
+
+	case *Fwd:
+		tv := targetType.(*Fwd)
+		return doNamesMatch(lv.name(), tv.name()), nil
+
+	case *Int:
+		tv := targetType.(*Int)
+		return !lv.isBitfield() && !tv.isBitfield(), nil
+
+	default:
+		return false, fmt.Errorf("type %s: %w", localType, ErrNotSupported)
+	}
 }
 
 func skipQualifierAndTypedef(typ Type) (Type, error) {
