@@ -150,9 +150,9 @@ func coreCalculateRelocation(local Type, targets []namedType, kind coreReloKind,
 		}
 
 		switch kind {
-		case reloTypeIDTarget:
-			if localAccessor[0] != 0 {
-				return Relocation{}, fmt.Errorf("%s: unexpected non-zero accessor", kind)
+		case reloTypeIDTarget, reloTypeSize, reloTypeExists:
+			if localAccessor[0] != 0 || len(localAccessor) > 1 {
+				return Relocation{}, fmt.Errorf("%s: unexpected accessor: %s", kind, localAccessor)
 			}
 
 			if compat, err := coreAreTypesCompatible(local, target); err != nil {
@@ -161,7 +161,26 @@ func coreCalculateRelocation(local Type, targets []namedType, kind coreReloKind,
 				continue
 			}
 
-			addRelo(target, uint32(local.ID()), uint32(target.ID()))
+			switch kind {
+			case reloTypeExists:
+				addRelo(target, 1, 1)
+
+			case reloTypeIDTarget:
+				addRelo(target, uint32(local.ID()), uint32(target.ID()))
+
+			case reloTypeSize:
+				localSize, err := Sizeof(local)
+				if err != nil {
+					return Relocation{}, err
+				}
+
+				targetSize, err := Sizeof(target)
+				if err != nil {
+					return Relocation{}, err
+				}
+
+				addRelo(target, uint32(localSize), uint32(targetSize))
+			}
 
 		case reloEnumvalValue, reloEnumvalExists:
 			localValue, targetValue, err := coreFindEnumValue(local, localAccessor, target)
@@ -187,7 +206,7 @@ func coreCalculateRelocation(local Type, targets []namedType, kind coreReloKind,
 
 	if len(relos) == 0 {
 		switch kind {
-		case reloEnumvalExists:
+		case reloTypeExists, reloEnumvalExists:
 			return Relocation{1, 0}, nil
 		}
 
